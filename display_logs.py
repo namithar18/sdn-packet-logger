@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """
-display_logs.py  –  Parse and display packet_log.txt in a readable table.
+display_logs.py  -  Parse and display packet_log.txt in a readable table.
 
 Usage:
-    python3 display_logs.py [log_file]        # default: packet_log.txt
+    python3 display_logs.py [log_file]              # default: packet_log.txt
     python3 display_logs.py packet_log.txt --proto TCP
     python3 display_logs.py packet_log.txt --stats
 """
@@ -13,15 +13,13 @@ import sys
 import argparse
 from collections import Counter, defaultdict
 
-
-# ── ANSI colours ────────────────────────────────────────────────────
-RESET  = "\033[0m"
-BOLD   = "\033[1m"
-CYAN   = "\033[36m"
-GREEN  = "\033[32m"
-YELLOW = "\033[33m"
-RED    = "\033[31m"
-BLUE   = "\033[34m"
+RESET   = "\033[0m"
+BOLD    = "\033[1m"
+CYAN    = "\033[36m"
+GREEN   = "\033[32m"
+YELLOW  = "\033[33m"
+RED     = "\033[31m"
+BLUE    = "\033[34m"
 MAGENTA = "\033[35m"
 
 PROTO_COLOR = {
@@ -29,15 +27,14 @@ PROTO_COLOR = {
     "UDP":  CYAN,
     "ICMP": YELLOW,
     "ARP":  BLUE,
+    "IPv4": MAGENTA,
+    "IPv6": RED,
 }
-
 
 def color_proto(proto):
     c = PROTO_COLOR.get(proto, MAGENTA)
     return f"{c}{BOLD}{proto:6}{RESET}"
 
-
-# ── Log line parser ──────────────────────────────────────────────────
 LINE_RE = re.compile(
     r"\[(?P<ts>[\d\-: .]+)\]\s+\[Switch (?P<sw>[^\]]+)\]\s+(?P<msg>.*)"
 )
@@ -56,66 +53,66 @@ def parse_log(path):
             })
     return entries
 
-
 def detect_proto(msg):
-    for p in ("TCP", "UDP", "ICMP", "ARP"):
-        if msg.startswith(p):
+    for p in ("TCP", "UDP", "ICMP", "ARP", "IPv4", "IPv6"):
+        if f"| {p}" in msg or f"| {p} " in msg:
             return p
+    if "0x86dd" in msg:
+        return "IPv6"
+    if "0x0800" in msg:
+        return "IPv4"
     return "OTHER"
 
-
 def extract_field(msg, key):
-    """Pull 'key=value' from a log message."""
     m = re.search(rf"{re.escape(key)}=([\w.:]+)", msg)
     return m.group(1) if m else "-"
 
+def extract_inport(msg):
+    m = re.search(r"in_port=(\d+)", msg)
+    return m.group(1) if m else "-"
 
-# ── Display functions ────────────────────────────────────────────────
+def extract_src_mac(msg):
+    m = re.search(r"src=([\w:]+)", msg)
+    return m.group(1) if m else "-"
+
 COL = "{:<26} {:<8} {:<8} {:<15} {:<15} {:<10} {:<10} {}"
 
 def print_header():
     h = COL.format("Timestamp", "Switch", "Proto", "Src IP", "Dst IP",
                     "Src Port", "Dst Port", "Extra")
     print(f"\n{BOLD}{h}{RESET}")
-    print("─" * 110)
-
+    print("-" * 110)
 
 def print_entry(e):
-    msg   = e["msg"]
-    proto = detect_proto(msg)
-
-    # Only print PKT lines (skip forwarding/flood meta lines)
+    msg = e["msg"]
     if not msg.startswith("PKT"):
         return
-
+    proto    = detect_proto(msg)
     src_ip   = extract_field(msg, "src_ip")
     dst_ip   = extract_field(msg, "dst_ip")
-    src_port = extract_field(msg, "src_port")
-    dst_port = extract_field(msg, "dst_port")
-    in_port  = extract_field(msg, "in_port")
+    src_port = extract_field(msg, "sport")
+    dst_port = extract_field(msg, "dport")
 
-    # Extra info: flags for TCP, icmp_type for ICMP
     extra = ""
     fm = re.search(r"flags=\[([^\]]*)\]", msg)
     if fm:
         extra = f"flags=[{fm.group(1)}]"
-    im = re.search(r"icmp_type=([^\|]+)", msg)
+    im = re.search(r"icmp=([^\|]+)", msg)
     if im:
         extra = im.group(1).strip()
 
-    row = COL.format(
+    print(COL.format(
         e["ts"], e["sw"][:6], color_proto(proto),
         src_ip[:15], dst_ip[:15],
         src_port[:10], dst_port[:10],
         extra
-    )
-    print(row)
-
+    ))
 
 def print_stats(entries):
-    proto_count  = Counter()
-    src_ip_count = Counter()
-    flow_count   = Counter()
+    proto_count   = Counter()
+    src_mac_count = Counter()
+    port_count    = Counter()
+    flow_count    = Counter()
 
     for e in entries:
         msg = e["msg"]
@@ -123,40 +120,44 @@ def print_stats(entries):
             continue
         proto = detect_proto(msg)
         proto_count[proto] += 1
+        src_mac_count[extract_src_mac(msg)] += 1
+        port_count[extract_inport(msg)] += 1
+
         src_ip = extract_field(msg, "src_ip")
         dst_ip = extract_field(msg, "dst_ip")
-        src_ip_count[src_ip] += 1
         if src_ip != "-" and dst_ip != "-":
             flow_count[(src_ip, dst_ip, proto)] += 1
 
     total = sum(proto_count.values())
 
-    print(f"\n{BOLD}{'─'*40}")
-    print(f"  PACKET STATISTICS  (total: {total})")
-    print(f"{'─'*40}{RESET}")
+    print(f"\n{BOLD}{'=' * 45}")
+    print(f"  PACKET STATISTICS  (total packets: {total})")
+    print(f"{'=' * 45}{RESET}")
 
-    print(f"\n{BOLD}By Protocol:{RESET}")
+    print(f"\n{BOLD}Protocol Breakdown:{RESET}")
     for proto, cnt in proto_count.most_common():
-        bar = "█" * (cnt * 30 // max(total, 1))
-        print(f"  {color_proto(proto)}  {cnt:>5}  {bar}")
+        pct = cnt * 100 // max(total, 1)
+        bar = "#" * (cnt * 30 // max(total, 1))
+        print(f"  {color_proto(proto)}  {cnt:>5} ({pct:>3}%)  {bar}")
 
-    print(f"\n{BOLD}Top Source IPs:{RESET}")
-    for ip, cnt in src_ip_count.most_common(10):
-        print(f"  {ip:<18} {cnt:>5} packets")
+    print(f"\n{BOLD}Top Source MACs:{RESET}")
+    for mac, cnt in src_mac_count.most_common(5):
+        print(f"  {mac:<22}  {cnt:>5} packets")
 
-    print(f"\n{BOLD}Top Flows (src → dst | proto):{RESET}")
+    print(f"\n{BOLD}Packets by In-Port:{RESET}")
+    for port, cnt in sorted(port_count.items()):
+        print(f"  port {port:<6}  {cnt:>5} packets")
+
+    print(f"\n{BOLD}Top Flows  (src_ip -> dst_ip | proto):{RESET}")
     for (src, dst, proto), cnt in flow_count.most_common(10):
-        print(f"  {src:<16} → {dst:<16}  {color_proto(proto)}  {cnt:>4} pkts")
-
+        print(f"  {src:<15} -> {dst:<15}  {color_proto(proto)}  {cnt:>4} pkts")
     print()
 
-
-# ── Main ─────────────────────────────────────────────────────────────
 def main():
     ap = argparse.ArgumentParser(description="Display POX Packet Logger output")
     ap.add_argument("logfile", nargs="?", default="packet_log.txt")
-    ap.add_argument("--proto",  help="Filter by protocol (TCP/UDP/ICMP/ARP)")
-    ap.add_argument("--stats",  action="store_true", help="Show statistics summary")
+    ap.add_argument("--proto", help="Filter by protocol: TCP / UDP / ICMP / ARP / IPv4 / IPv6")
+    ap.add_argument("--stats", action="store_true", help="Show statistics only")
     args = ap.parse_args()
 
     try:
@@ -171,13 +172,15 @@ def main():
 
     print_header()
     for e in entries:
-        if args.proto and not e["msg"].startswith(args.proto):
+        msg = e["msg"]
+        if not msg.startswith("PKT"):
+            continue
+        # BUG FIX: filter by detected protocol, not by startswith(proto)
+        if args.proto and detect_proto(msg).upper() != args.proto.upper():
             continue
         print_entry(e)
 
-    # Always show mini-stats at the end
     print_stats(entries)
-
 
 if __name__ == "__main__":
     main()
